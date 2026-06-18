@@ -3,10 +3,8 @@
 ## 安装依赖
 
 ```bash
-# 在项目虚拟环境中安装 tornado
-.venv\Scripts\pip install tornado
-# 或者用 uv
-uv pip install tornado
+# 在本服务目录安装依赖
+pip install -r requirements.txt
 ```
 
 ---
