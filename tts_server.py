@@ -161,6 +161,92 @@ def _cleanup_upload_files():
         logger.info("已清理 upload_files 目录，共删除 %d 个文件。", removed)
 
 
+def _process_memory_mb():
+    try:
+        import psutil
+
+        return round(psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024, 1)
+    except Exception:
+        return None
+
+
+def _trim_process_working_set():
+    """
+    尽量把 Python 进程已释放但仍驻留在 working set 中的内存还给系统。
+
+    Windows 上 PyTorch/NumPy 释放大对象后，进程 RSS/任务管理器内存可能不会立刻下降；
+    EmptyWorkingSet 可以提示系统回收当前进程的可丢弃物理页。它不会减少 Python
+    allocator 仍持有的虚拟地址空间，但能明显改善“内存占满”的表象。
+    """
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            psapi = ctypes.WinDLL("psapi", use_last_error=True)
+            kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+            psapi.EmptyWorkingSet.argtypes = [ctypes.c_void_p]
+            psapi.EmptyWorkingSet.restype = ctypes.c_int
+
+            handle = kernel32.GetCurrentProcess()
+            if not psapi.EmptyWorkingSet(handle):
+                raise OSError(ctypes.get_last_error(), "EmptyWorkingSet failed")
+            return True
+
+        if sys.platform.startswith("linux"):
+            import ctypes
+
+            libc = ctypes.CDLL("libc.so.6")
+            if hasattr(libc, "malloc_trim"):
+                libc.malloc_trim(0)
+                return True
+    except Exception as e:
+        logger.warning("进程 working set 修剪失败: %s", e)
+    return False
+
+
+def _cleanup_process_memory():
+    before_mb = _process_memory_mb()
+    for _ in range(3):
+        gc.collect()
+
+    cuda_cleaned = False
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception as e:
+            logger.debug("torch.cuda.ipc_collect 跳过: %s", e)
+        cuda_cleaned = True
+
+    for _ in range(2):
+        gc.collect()
+    working_set_trimmed = _trim_process_working_set()
+    after_mb = _process_memory_mb()
+
+    if before_mb is not None and after_mb is not None:
+        logger.info(
+            "内存清理完成: %.1f MB -> %.1f MB (CUDA=%s, working_set_trimmed=%s)",
+            before_mb,
+            after_mb,
+            cuda_cleaned,
+            working_set_trimmed,
+        )
+    else:
+        logger.info("内存清理完成: CUDA=%s, working_set_trimmed=%s", cuda_cleaned, working_set_trimmed)
+
+    return {
+        "memory_before_mb": before_mb,
+        "memory_after_mb": after_mb,
+        "cuda_cleaned": cuda_cleaned,
+        "working_set_trimmed": working_set_trimmed,
+    }
+
+
 def _do_load_model(model_dir, cfg_path, fp16, cuda_kernel, deepspeed):
     """
     实际执行模型加载，返回 IndexTTS2 实例。
@@ -194,13 +280,12 @@ def _do_unload_model():
         if hasattr(tts_model, attr):
             delattr(tts_model, attr)
     tts_model = None
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    cleanup_result = _cleanup_process_memory()
+    if cleanup_result.get("cuda_cleaned"):
         logger.info("GPU 显存已释放。")
     _cleanup_upload_files()
     logger.info("模型已卸载。")
-    return True
+    return cleanup_result
 
 
 # ---------------------------------------------------------------------------
@@ -352,18 +437,20 @@ class ModelUnloadHandler(tornado.web.RequestHandler):
     def post(self):
         global tts_model
 
-        if tts_model is None:
-            self.finish({"status": "not_loaded"})
-            return
-
         if not model_lock.acquire(blocking=False):
             self.set_status(503)
             self.finish({"error": "模型正在加载/卸载中，请稍后重试"})
             return
 
         try:
-            unloaded = _do_unload_model()
-            self.finish({"status": "unloaded" if unloaded else "not_loaded"})
+            if tts_model is None:
+                cleanup_result = _cleanup_process_memory()
+                _cleanup_upload_files()
+                self.finish({"status": "not_loaded", "cleanup": cleanup_result})
+                return
+
+            cleanup_result = _do_unload_model()
+            self.finish({"status": "unloaded", "cleanup": cleanup_result})
         except Exception as e:
             logger.exception("模型卸载失败")
             self.set_status(500)
