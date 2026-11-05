@@ -84,6 +84,7 @@ API 接口说明:
         卸载模型并释放 GPU 显存；若模型未加载则返回: {"status": "not_loaded"}
 """
 
+import asyncio
 import gc
 import os
 import sys
@@ -306,6 +307,7 @@ class HealthHandler(tornado.web.RequestHandler):
             "status": "ok",
             "model_loaded": tts_model is not None,
             "model_version": version,
+            "event_loop": type(tornado.ioloop.IOLoop.current().asyncio_loop).__name__,
         })
 
 
@@ -806,6 +808,11 @@ def make_app():
 def main():
     global tts_model, default_spk_audio, default_model_args
 
+    # Tornado needs add_reader/add_writer. A native selector avoids the Windows
+    # Proactor bridge whose background selector can die while HTTP stays bound.
+    if sys.platform == "win32":
+        asyncio.set_event_loop(asyncio.SelectorEventLoop())
+
     # ---------------------------------------------------------------------- #
     # 命令行参数定义                                                            #
     # ---------------------------------------------------------------------- #
@@ -875,11 +882,15 @@ def main():
     logger.info("IndexTTS2 HTTP 服务已启动，监听地址: http://%s:%d", args.host, args.port)
     logger.info("可用接口:  POST /tts   GET /health   GET /model/status   POST /model/load   POST /model/unload   GET /files/check   POST /files/upload")
 
+    io_loop = tornado.ioloop.IOLoop.current()
+    logger.info("HTTP event loop: %s", type(io_loop.asyncio_loop).__name__)
     try:
-        tornado.ioloop.IOLoop.current().start()
+        io_loop.start()
     except KeyboardInterrupt:
         logger.info("收到退出信号，正在关闭服务...")
-        tornado.ioloop.IOLoop.current().stop()
+    finally:
+        server.stop()
+        io_loop.close(all_fds=True)
 
 
 if __name__ == "__main__":
